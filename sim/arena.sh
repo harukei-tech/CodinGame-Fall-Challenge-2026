@@ -31,7 +31,8 @@ play() {
   echo "seat=$seat $line"
 }
 export -f play
-seq 1 "$GAMES" | xargs -P "$JOBS" -I{} bash -c 'play {}' | tee sim/results/last.txt > /dev/null
+# SEEDS を指定すると、そのシードだけを対戦する。
+{ if [[ -n ${SEEDS:-} ]]; then tr ' ' '\n' <<<"$SEEDS"; else seq 1 "$GAMES"; fi; } | xargs -P "$JOBS" -I{} bash -c 'play {}' | tee sim/results/last.txt > /dev/null
 # 勝敗を席に関係なく「自分」から見た形で集計する。
 awk '{
   seat = substr($1, 6); split($4, a, "="); split($5, b, "="); s0 = a[2] + 0; s1 = b[2] + 0
