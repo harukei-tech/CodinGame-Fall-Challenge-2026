@@ -14,7 +14,7 @@ import java.util.*;
  * units have left all
  * three corners.
  * - 家の持ち主は、隣の家すべてで多い側になる。そこにユニットがいなくてもよい。
- * 隣が2軒だけの角は、残り2つの角を押さえれば自分の家になるので、三角形を2体で占領できる。
+ * 角Xにユニットを送る代わりに、Xの隣をすべて押さえても占領できる。隣が2軒だけなら残り2つの角で足りる。
  * - 包囲の判定は隣の家だけを見る。隣の家をすべて敵に押さえられると、
  * 自分の家に何体いても全滅する。移動の後に判定するので、敵は1ターンで囲める。
  */
@@ -39,6 +39,10 @@ class Player {
     static final double VALUE_SURROUND_PER_UNIT = 1.0;
     /** 局所探索での、包囲される恐れへの減点。ユニット1体あたりの値。 */
     static final double SURROUND_DANGER_PENALTY = 0;
+    /** 角の隣を押さえて占領する案で、押さえる追加の家の数の上限。 */
+    static final int COVER_MAX_EXTRA_HOUSES = 2;
+    /** 角の隣を押さえて占領する案の得点の倍率。その角が空くのでロック解除が速く、そこの敵も倒せる。 */
+    static final double COVER_BONUS = 1.2;
     /** 隣の家がこの数より多い敵は、囲むのに手間がかかるので狙わない。 */
     static final int SURROUND_MAX_NEIGHBORS = 4;
     /** 敵は動くので、この移動ターン数以内に囲める場合だけ狙う。 */
@@ -426,7 +430,9 @@ class Player {
                     // 隣が2軒だけの角は、残りの角を押さえれば手に入るので、ユニットを送らない。
                     required[k] = isFreeCorner(corner) ? 0 : opponentUnits[corner] + 1;
                 }
-                jobs.add(new Job(t, triHouses[t], required, owner[t] == 1 ? VALUE_ENEMY : VALUE_NEUTRAL));
+                double value = owner[t] == 1 ? VALUE_ENEMY : VALUE_NEUTRAL;
+                jobs.add(new Job(t, triHouses[t], required, value));
+                addCoverJobs(jobs, t, value);
             } else if (owner[t] == 0 && threatened(t)) {
                 int corner = cheapestBlock(t);
                 jobs.add(new Job(t, new int[] { corner }, new int[] { enemyReach(corner) }, VALUE_DEFEND));
@@ -434,6 +440,32 @@ class Player {
         }
         addSurroundJobs(jobs);
         return jobs;
+    }
+
+    /**
+     * 三角形の角Xごとに、Xへ送らずXの隣をすべて押さえて占領する案を追加する。
+     * 残りの2つの角はどの案でも必要なので、押さえる家は「残りの角」と「Xの残りの隣」になる。
+     * 別の仕事で隣を押さえる予定があれば、scoreJobでその分のコストが0になり、この案が選ばれやすくなる。
+     */
+    static void addCoverJobs(List<Job> jobs, int triangle, double value) {
+        int[] corners = triHouses[triangle];
+        for (int covered : corners) {
+            int extraCount = neighbors[covered].length - 2;
+            if (extraCount < 1 || extraCount > COVER_MAX_EXTRA_HOUSES)
+                continue;
+            int[] houses = new int[2 + extraCount];
+            int count = 0;
+            for (int corner : corners)
+                if (corner != covered)
+                    houses[count++] = corner;
+            for (int neighbor : neighbors[covered])
+                if (neighbor != houses[0] && neighbor != houses[1])
+                    houses[count++] = neighbor;
+            int[] required = new int[houses.length];
+            for (int i = 0; i < houses.length; i++)
+                required[i] = isFreeCorner(houses[i]) && i < 2 ? 0 : opponentUnits[houses[i]] + 1;
+            jobs.add(new Job(triangle, houses, required, value * COVER_BONUS));
+        }
     }
 
     /**
@@ -504,6 +536,10 @@ class Player {
                 return;
             commit(best);
             jobs.remove(best);
+            // 同じ三角形の別の案は、もう要らない。
+            final int done = best.triangle;
+            if (done >= 0)
+                jobs.removeIf(job -> job.triangle == done);
         }
     }
 
