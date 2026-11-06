@@ -1,0 +1,12 @@
+services:
+  java:
+    # 別のバージョンを使う場合: JAVA_VERSION=25 docker compose run --rm java
+    image: eclipse-temurin:${JAVA_VERSION:-21}-jdk
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+    # 生成された .class などがホストのユーザー所有になるよう揃える
+    user: "${HOST_UID:-1000}:${HOST_GID:-1001}"
+    stdin_open: true
+    tty: true
+    command: bash
