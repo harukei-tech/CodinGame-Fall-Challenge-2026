@@ -2,7 +2,7 @@ import java.io.*;
 import java.util.*;
 
 /**
- * Fall Challenge 2026 (TryAngle Catch) bot. Bronze league: MOVE and SPAWN only.
+ * Fall Challenge 2026 (TryAngle Catch) bot. Uses MOVE, SPAWN and ATTACK.
  *
  * Rules that drive the design (from the referee source):
  * - A captured triangle stays ours after our units leave, so units keep moving
@@ -13,6 +13,8 @@ import java.util.*;
  * - SPAWN makes the triangle neutral, and we can only recapture it once our
  * units have left all
  * three corners.
+ * - 包囲の判定は隣の家だけを見る。隣の家をすべて敵に押さえられると、
+ * 自分の家に何体いても全滅する。移動の後に判定するので、敵は1ターンで囲める。
  */
 class Player {
     static final int MAX_TURNS = 200;
@@ -31,6 +33,31 @@ class Player {
     static final double VALUE_NEUTRAL = 1.0;
     static final double VALUE_ENEMY = 2.2;
     static final double VALUE_DEFEND = 2.0;
+    /** 敵を包囲する仕事の価値。倒せる敵ユニット1体あたりの値。 */
+    static final double VALUE_SURROUND_PER_UNIT = 1.0;
+    /** 隣の家がこの数より多い敵は、囲むのに手間がかかるので狙わない。 */
+    static final int SURROUND_MAX_NEIGHBORS = 4;
+    /** 敵は動くので、この移動ターン数以内に囲める場合だけ狙う。 */
+    static final int SURROUND_MAX_TIME = 2;
+    /** 余りユニットは、この距離以内に敵がいれば、ロック解除より敵を優先する。 */
+    static final int LEFTOVER_ENEMY_CLOSE_DISTANCE = 2;
+    /** 倒せる敵がこの数以上のときだけATTACKする。自軍も3体失うので、それより多く倒す必要がある。 */
+    static final int ATTACK_MIN_KILLS = 4;
+    /** この数以上で固まった家は、敵のATTACKに狙われるものとして減点する。 */
+    static final int STACK_RISK_UNITS = 3;
+    static final double STACK_RISK_PENALTY = 0.15;
+    /** ロック中の三角形を解除できる配置の価値。 */
+    static final double VALUE_UNLOCK = 0.5;
+    /** 三角形の3つの角のうち、条件を満たす角の数ごとの得点の割合。途中の段階にも点を付けて探索を導く。 */
+    static final double[] PARTIAL_CREDIT = { 0, 0.05, 0.25, 1 };
+    /** 局所探索で、ユニット1体の行き先を元の計画から変えるときの減点。 */
+    static final double PLAN_CHANGE_PENALTY = 0.3;
+    /** 移動計画の局所探索に使える時間。 */
+    static final long LOCAL_SEARCH_BUDGET_NANOS = 15_000_000L;
+    /** 敵の配置がこのターン数変わらなければ、敵は止まっていると見なす。 */
+    static final int ENEMY_IDLE_TURNS = 2;
+    /** 包囲対策に使える時間。1ターン50msの制限に余裕を残す。 */
+    static final long SURROUND_CHECK_BUDGET_NANOS = 32_000_000L;
 
     static int houseCount;
     static int[] houseXs, houseYs, myUnits, opponentUnits;
@@ -56,6 +83,15 @@ class Player {
     /** moves[移動元][移動先]: 今ターンに隣の家へ動かすユニットの数。最後にMOVEコマンドへ変換する。 */
     static int[][] moves;
 
+    static final Random random = new Random(0);
+    /** 前のターンの敵ユニットの配置。 */
+    static int[] previousOpponentUnits;
+    /** 敵の配置が続けて変わっていないターン数。 */
+    static int enemyIdleTurns;
+
+    /** 今ターンの入力を読み終えた時刻。 */
+    static long turnStartNanos;
+
     static StreamTokenizer in;
 
     static int next() throws IOException {
@@ -78,9 +114,35 @@ class Player {
         opponentUnits = new int[houseCount];
         for (int turn = 1;; turn++) {
             readTurn();
+            turnStartNanos = System.nanoTime();
+            updateEnemyIdle();
+            logTurn(turn);
             System.out.println(decide(turn));
             System.out.flush();
         }
+    }
+
+    /** テスト対戦のログで戦況を追うため、ターンごとの要約を標準エラーに出す。 */
+    static void logTurn(int turn) {
+        int mine = 0, theirs = 0, myTriangles = 0, theirTriangles = 0;
+        for (int house = 0; house < houseCount; house++) {
+            mine += myUnits[house];
+            theirs += opponentUnits[house];
+        }
+        for (int triangle = 0; triangle < triCount; triangle++) {
+            if (owner[triangle] == 0)
+                myTriangles++;
+            else if (owner[triangle] == 1)
+                theirTriangles++;
+        }
+        System.err.println("T" + turn + " score=" + myScore + "/" + opponentScore + " units=" + mine + "/" + theirs
+                + " tri=" + myTriangles + "/" + theirTriangles + "/" + triCount);
+    }
+
+    /** 敵が動いたかどうかを記録する。 */
+    static void updateEnemyIdle() {
+        enemyIdleTurns = Arrays.equals(opponentUnits, previousOpponentUnits) ? enemyIdleTurns + 1 : 0;
+        previousOpponentUnits = opponentUnits.clone();
     }
 
     static void readTurn() throws IOException {
@@ -168,14 +230,18 @@ class Player {
     }
 
     static String decide(int turn) {
+        List<String> commands = new ArrayList<>();
+        addAttacks(commands);
+
         free = myUnits.clone();
         committed = new int[houseCount];
         moves = new int[houseCount][houseCount];
 
         assignTargets();
         assignLeftovers();
+        improveMoves();
+        avoidSurrounds();
 
-        List<String> commands = new ArrayList<>();
         for (int from = 0; from < houseCount; from++) {
             for (int to = 0; to < houseCount; to++) {
                 if (moves[from][to] > 0)
@@ -187,6 +253,33 @@ class Player {
     }
 
     /**
+     * 3つの角にユニットがいる自分の三角形で、隣の敵の塊を倒す。
+     * ATTACKは移動より先に処理されるので、盤面の情報を攻撃後の状態に更新してから移動を決める。
+     */
+    static void addAttacks(List<String> commands) {
+        for (int triangle = 0; triangle < triCount; triangle++) {
+            int[] corners = triHouses[triangle];
+            if (owner[triangle] != 0 || myUnits[corners[0]] == 0 || myUnits[corners[1]] == 0 || myUnits[corners[2]] == 0)
+                continue;
+            int target = -1;
+            for (int corner : corners) {
+                for (int neighbor : neighbors[corner]) {
+                    if (target < 0 || opponentUnits[neighbor] > opponentUnits[target])
+                        target = neighbor;
+                }
+            }
+            if (target < 0 || opponentUnits[target] < ATTACK_MIN_KILLS)
+                continue;
+            commands.add("ATTACK " + corners[0] + " " + corners[1] + " " + corners[2] + " " + target);
+            opponentUnits[target] = 0;
+            owner[triangle] = -1;
+            meCanCapture[triangle] = false;
+            for (int corner : corners)
+                myUnits[corner]--;
+        }
+    }
+
+    /**
      * One job: bring `required[i]` units to `houses[i]`, for a triangle to capture
      * or defend.
      */
@@ -195,12 +288,19 @@ class Player {
         final int[] required;
         final double value;
         final int triangle;
+        /** この移動ターン数を超える仕事は引き受けない。 */
+        final int maxTime;
 
         Job(int triangle, int[] houses, int[] required, double value) {
+            this(triangle, houses, required, value, Integer.MAX_VALUE);
+        }
+
+        Job(int triangle, int[] houses, int[] required, double value, int maxTime) {
             this.triangle = triangle;
             this.houses = houses;
             this.required = required;
             this.value = value;
+            this.maxTime = maxTime;
         }
     }
 
@@ -217,7 +317,22 @@ class Player {
                 jobs.add(new Job(t, new int[] { corner }, new int[] { enemyReach(corner) }, VALUE_DEFEND));
             }
         }
+        addSurroundJobs(jobs);
         return jobs;
+    }
+
+    /** 敵のいる家ごとに、隣の家をすべて押さえて敵を倒す仕事を追加する。 */
+    static void addSurroundJobs(List<Job> jobs) {
+        for (int enemyHouse = 0; enemyHouse < houseCount; enemyHouse++) {
+            int[] around = neighbors[enemyHouse];
+            if (opponentUnits[enemyHouse] == 0 || around.length == 0 || around.length > SURROUND_MAX_NEIGHBORS)
+                continue;
+            int[] required = new int[around.length];
+            for (int i = 0; i < around.length; i++)
+                required[i] = opponentUnits[around[i]] + 1;
+            double value = VALUE_SURROUND_PER_UNIT * opponentUnits[enemyHouse];
+            jobs.add(new Job(-1, around, required, value, SURROUND_MAX_TIME));
+        }
     }
 
     /** Most enemy units that can stand on this house next turn. */
@@ -288,6 +403,8 @@ class Player {
                 travel += distances[from][house];
             }
         }
+        if (time > job.maxTime)
+            return -1;
         return job.value / (1 + time + 0.25 * travel);
     }
 
@@ -372,27 +489,278 @@ class Player {
         for (int candidate = 0; candidate < houseCount; candidate++) {
             boolean hasEnemy = opponentUnits[candidate] > 0;
             // 割り当てが敵より多くなれば家を確保できるので、それ以上は送らない。
-            boolean needsMoreUnits = committed[candidate] <= opponentUnits[candidate];
+            // まだ行き先が決まっていない、その家のユニットも味方として数える。
+            boolean needsMoreUnits = committed[candidate] + free[candidate] <= opponentUnits[candidate];
             boolean reachable = distances[house][candidate] < UNREACHABLE;
             if (hasEnemy && needsMoreUnits && reachable
                     && (best < 0 || distances[house][candidate] < distances[house][best]))
                 best = candidate;
         }
-        if (best >= 0 || !isLockedHouse[house])
+        boolean enemyIsClose = best >= 0 && distances[house][best] <= LEFTOVER_ENEMY_CLOSE_DISTANCE;
+        if (enemyIsClose || !isLockedHouse[house])
             return best;
 
-        // 向かう敵がいないので、三角形を再占領できるようにロック中の家から離れる。
+        // 近くに敵がいないので、三角形を再占領できるようにロック中の家から離れる。
+        int enemyTarget = best;
+        best = -1;
         for (int candidate = 0; candidate < houseCount; candidate++) {
             boolean reachable = distances[house][candidate] < UNREACHABLE;
             if (!isLockedHouse[candidate] && reachable
                     && (best < 0 || distances[house][candidate] < distances[house][best]))
                 best = candidate;
         }
-        return best;
+        return best >= 0 ? best : enemyTarget;
+    }
+
+    /**
+     * 移動計画をランダムに少しずつ変え、moveScoreが上がる変更だけを採用する。
+     * 上がらない変更は捨てるので、遠くの仕事へ向かう移動はそのまま残る。
+     */
+    static void improveMoves() {
+        int unitCount = 0;
+        for (int house = 0; house < houseCount; house++)
+            unitCount += myUnits[house];
+        if (unitCount == 0)
+            return;
+
+        // ユニット1体ごとの移動元と移動先の一覧に展開する。
+        int[] unitFrom = new int[unitCount], unitTo = new int[unitCount];
+        int index = 0;
+        for (int from = 0; from < houseCount; from++) {
+            int staying = stayingUnits(from);
+            for (int i = 0; i < staying; i++) {
+                unitFrom[index] = from;
+                unitTo[index++] = from;
+            }
+            for (int to = 0; to < houseCount; to++) {
+                for (int i = 0; i < moves[from][to]; i++) {
+                    unitFrom[index] = from;
+                    unitTo[index++] = to;
+                }
+            }
+        }
+
+        boolean[] attackable = housesEnemyCanAttack();
+        int[] projected = projectedUnits();
+        // 元の計画は遠くの仕事へ向かう移動を含むので、確かな得がなければ変えない。
+        int[] plannedTo = unitTo.clone();
+        int deviations = 0;
+        double bestScore = moveScore(projected, attackable);
+        long deadline = System.nanoTime() + LOCAL_SEARCH_BUDGET_NANOS;
+        for (int iteration = 0;; iteration++) {
+            if ((iteration & 255) == 0 && System.nanoTime() > deadline)
+                break;
+            int unit = random.nextInt(unitCount);
+            int[] options = neighbors[unitFrom[unit]];
+            int choice = random.nextInt(options.length + 1);
+            int newTo = choice == options.length ? unitFrom[unit] : options[choice];
+            int oldTo = unitTo[unit];
+            if (newTo == oldTo)
+                continue;
+            projected[oldTo]--;
+            projected[newTo]++;
+            int newDeviations = deviations + (newTo != plannedTo[unit] ? 1 : 0) - (oldTo != plannedTo[unit] ? 1 : 0);
+            double score = moveScore(projected, attackable) - PLAN_CHANGE_PENALTY * newDeviations;
+            if (score > bestScore + 1e-9) {
+                bestScore = score;
+                deviations = newDeviations;
+                unitTo[unit] = newTo;
+            } else {
+                projected[oldTo]++;
+                projected[newTo]--;
+            }
+        }
+
+        moves = new int[houseCount][houseCount];
+        for (int unit = 0; unit < unitCount; unit++) {
+            if (unitTo[unit] != unitFrom[unit])
+                moves[unitFrom[unit]][unitTo[unit]]++;
+        }
+    }
+
+    /** 敵が次のターンにATTACKできる家をtrueにした配列を返す。 */
+    static boolean[] housesEnemyCanAttack() {
+        boolean[] attackable = new boolean[houseCount];
+        for (int triangle = 0; triangle < triCount; triangle++) {
+            int[] corners = triHouses[triangle];
+            if (owner[triangle] != 1 || opponentUnits[corners[0]] == 0 || opponentUnits[corners[1]] == 0
+                    || opponentUnits[corners[2]] == 0)
+                continue;
+            for (int corner : corners)
+                for (int neighbor : neighbors[corner])
+                    attackable[neighbor] = true;
+        }
+        return attackable;
+    }
+
+    /** 移動後の配置の良さを返す。次のターンの占領とロック解除を加点し、狙われる塊を減点する。 */
+    static double moveScore(int[] projected, boolean[] attackable) {
+        double score = 0;
+        for (int triangle = 0; triangle < triCount; triangle++) {
+            if (owner[triangle] == 0)
+                continue;
+            int[] corners = triHouses[triangle];
+            int a = corners[0], b = corners[1], c = corners[2];
+            if (meCanCapture[triangle]) {
+                int held = (projected[a] > opponentUnits[a] ? 1 : 0) + (projected[b] > opponentUnits[b] ? 1 : 0)
+                        + (projected[c] > opponentUnits[c] ? 1 : 0);
+                double value = owner[triangle] == 1 ? VALUE_ENEMY : VALUE_NEUTRAL;
+                score += value * PARTIAL_CREDIT[held];
+            } else {
+                int empty = (projected[a] == 0 ? 1 : 0) + (projected[b] == 0 ? 1 : 0) + (projected[c] == 0 ? 1 : 0);
+                score += VALUE_UNLOCK * PARTIAL_CREDIT[empty];
+            }
+        }
+        for (int house = 0; house < houseCount; house++) {
+            if (attackable[house] && projected[house] >= STACK_RISK_UNITS)
+                score -= STACK_RISK_PENALTY * projected[house];
+        }
+        return score;
+    }
+
+    /**
+     * 立てた移動計画を見直し、次のターンに包囲されるユニットが減るように修正する。
+     * ユニット1体の行き先を変える案をすべて試し、最も危険が減る案を採用する。
+     * 危険が減らなくなるか、時間がなくなったら終わる。
+     */
+    static void avoidSurrounds() {
+        // 止まっている敵は包囲してこないので、警戒すると自分の動きを止めるだけになる。
+        if (enemyIdleTurns >= ENEMY_IDLE_TURNS)
+            return;
+        int[] projected = projectedUnits();
+        int risk = unitsAtRisk(projected);
+        while (risk > 0 && System.nanoTime() - turnStartNanos < SURROUND_CHECK_BUDGET_NANOS) {
+            int bestFrom = -1, bestOldTo = -1, bestNewTo = -1, bestRisk = risk;
+            boolean[] nearRisk = housesNearRisk(projected);
+            for (int from = 0; from < houseCount; from++) {
+                if (myUnits[from] == 0 || !nearRisk[from])
+                    continue;
+                int staying = stayingUnits(from);
+                for (int oldTo = 0; oldTo < houseCount; oldTo++) {
+                    boolean hasUnitGoing = oldTo == from ? staying > 0 : moves[from][oldTo] > 0;
+                    if (!hasUnitGoing)
+                        continue;
+                    projected[oldTo]--;
+                    for (int newTo = -1; newTo < neighbors[from].length; newTo++) {
+                        // newToが-1の案は「移動をやめて、その場に残る」を表す。
+                        int destination = newTo < 0 ? from : neighbors[from][newTo];
+                        if (destination == oldTo)
+                            continue;
+                        projected[destination]++;
+                        int newRisk = unitsAtRisk(projected);
+                        projected[destination]--;
+                        if (newRisk < bestRisk) {
+                            bestRisk = newRisk;
+                            bestFrom = from;
+                            bestOldTo = oldTo;
+                            bestNewTo = destination;
+                        }
+                    }
+                    projected[oldTo]++;
+                }
+            }
+            if (bestFrom < 0)
+                return;
+            if (bestOldTo != bestFrom)
+                moves[bestFrom][bestOldTo]--;
+            if (bestNewTo != bestFrom)
+                moves[bestFrom][bestNewTo]++;
+            projected[bestOldTo]--;
+            projected[bestNewTo]++;
+            risk = bestRisk;
+        }
+    }
+
+    /** 今ターンの移動後に、各家にいる自分のユニット数を返す。 */
+    static int[] projectedUnits() {
+        int[] projected = myUnits.clone();
+        for (int from = 0; from < houseCount; from++) {
+            for (int to = 0; to < houseCount; to++) {
+                projected[from] -= moves[from][to];
+                projected[to] += moves[from][to];
+            }
+        }
+        return projected;
+    }
+
+    /** fromにいるユニットのうち、今ターンに動かないユニットの数を返す。 */
+    static int stayingUnits(int from) {
+        int staying = myUnits[from];
+        for (int to = 0; to < houseCount; to++)
+            staying -= moves[from][to];
+        return staying;
+    }
+
+    /** 包囲される恐れのある家と、その隣の家をtrueにした配列を返す。修正案を試す範囲を絞るために使う。 */
+    static boolean[] housesNearRisk(int[] projected) {
+        boolean[] near = new boolean[houseCount];
+        for (int house = 0; house < houseCount; house++) {
+            if (projected[house] > 0 && canBeSurrounded(house, projected)) {
+                near[house] = true;
+                for (int neighbor : neighbors[house])
+                    near[neighbor] = true;
+            }
+        }
+        return near;
+    }
+
+    /** 次のターンに包囲される恐れのあるユニットの合計を返す。 */
+    static int unitsAtRisk(int[] projected) {
+        int total = 0;
+        for (int house = 0; house < houseCount; house++) {
+            if (projected[house] > 0 && canBeSurrounded(house, projected))
+                total += projected[house];
+        }
+        return total;
+    }
+
+    /**
+     * 敵が次のターンに、houseの隣の家すべてで自分より多くなれるかを判定する。
+     * 敵ユニットは1体につき1か所にしか行けないので、余っている敵だけを足りない家へ回して数える。
+     */
+    static boolean canBeSurrounded(int house, int[] projected) {
+        int[] around = neighbors[house];
+        if (around.length == 0)
+            return false;
+        int[] spareEnemies = opponentUnits.clone();
+        int[] shortage = new int[around.length];
+        for (int i = 0; i < around.length; i++) {
+            int neighbor = around[i];
+            int enemiesNeeded = projected[neighbor] + 1;
+            int kept = Math.min(spareEnemies[neighbor], enemiesNeeded);
+            spareEnemies[neighbor] -= kept;
+            shortage[i] = enemiesNeeded - kept;
+            // 敵はSPAWNでも1体増やせる。SPAWNは移動の後、包囲の判定の前に行われる。
+            if (shortage[i] > 0 && enemyCanSpawnOn(neighbor))
+                shortage[i]--;
+        }
+        for (int i = 0; i < around.length; i++) {
+            for (int source : neighbors[around[i]]) {
+                int sent = Math.min(spareEnemies[source], shortage[i]);
+                spareEnemies[source] -= sent;
+                shortage[i] -= sent;
+            }
+            if (shortage[i] > 0)
+                return false;
+        }
+        return true;
+    }
+
+    /** 敵が持っている三角形の角なら、敵はそこにSPAWNできる。 */
+    static boolean enemyCanSpawnOn(int house) {
+        for (int triangle = 0; triangle < triCount; triangle++) {
+            if (owner[triangle] != 1)
+                continue;
+            for (int corner : triHouses[triangle])
+                if (corner == house)
+                    return true;
+        }
+        return false;
     }
 
     static void addSpawns(int turn, List<String> commands) {
-        if (MAX_TURNS - turn < SPAWN_STOP_TURNS_LEFT)
+        // 敵が止まったら、三角形を持ち続けるだけで得点差が開いていく。
+        if (MAX_TURNS - turn < SPAWN_STOP_TURNS_LEFT || enemyIdleTurns >= ENEMY_IDLE_TURNS)
             return;
         int mine = 0, theirs = 0;
         for (int i = 0; i < houseCount; i++) {

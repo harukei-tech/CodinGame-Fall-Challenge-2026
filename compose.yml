@@ -10,3 +10,30 @@ services:
     stdin_open: true
     tty: true
     command: bash
+
+  # 公式の審判でローカル対戦を行う環境（使い方は sim/README.md）
+  referee:
+    image: maven:3.9-eclipse-temurin-11
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+      - ./sim/.cache/maven:/maven-cache
+    user: "${HOST_UID:-1000}:${HOST_GID:-1001}"
+    environment:
+      MAVEN_OPTS: -Dmaven.repo.local=/maven-cache
+      HOME: /tmp
+    depends_on:
+      - boss
+
+  # 公開されているボス（C#）をビルドして、referee からのTCP接続を待ち受ける環境
+  # dotnet は passwd にないユーザーでは動かないので root で動かす。
+  # sim は読み取り専用でマウントし、ビルドはコンテナ内の /tmp で行うので、ホストにファイルは作らない。
+  boss:
+    image: mcr.microsoft.com/dotnet/sdk:8.0
+    working_dir: /sim/boss
+    volumes:
+      - ./sim:/sim:ro
+    environment:
+      DOTNET_NOLOGO: "1"
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+    command: bash start.sh

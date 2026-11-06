@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <TieredPGO>false</TieredPGO>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- 本番の Silver ボスに最も近い level3。ADD_PATH は start.sh で無効にしている。 -->
+    <Compile Include="../../ref/config/level3/Boss.cs" />
+  </ItemGroup>
+</Project>
