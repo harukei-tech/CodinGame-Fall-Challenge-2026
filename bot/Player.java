@@ -2,7 +2,7 @@ import java.io.*;
 import java.util.*;
 
 /**
- * Fall Challenge 2026 (TryAngle Catch) bot. Uses MOVE, SPAWN and ATTACK.
+ * Fall Challenge 2026 (TryAngle Catch) bot. Uses MOVE, SPAWN, ATTACK, ADD_PATH and REMOVE_PATH.
  *
  * Rules that drive the design (from the referee source):
  * - A captured triangle stays ours after our units leave, so units keep moving
@@ -42,7 +42,11 @@ class Player {
     /** 角の隣を押さえて占領する案で、押さえる追加の家の数の上限。 */
     static final int COVER_MAX_EXTRA_HOUSES = 2;
     /** 角の隣を押さえて占領する案の得点の倍率。その角が空くのでロック解除が速く、そこの敵も倒せる。 */
-    static final double COVER_BONUS = 1.2;
+    static final double COVER_BONUS = 1.0;
+    /** ADD_PATHを使う条件。三角形を1つ手放すので、新しい三角形をこの数以上すぐ占領できるときだけ使う。 */
+    static final int ADD_PATH_MIN_TRIANGLES = 2;
+    /** REMOVE_PATHを使う条件。三角形を1つ手放すので、敵の三角形をこの数以上消せるときだけ使う。 */
+    static final int REMOVE_PATH_MIN_TRIANGLES = 2;
     /** 隣の家がこの数より多い敵は、囲むのに手間がかかるので狙わない。 */
     static final int SURROUND_MAX_NEIGHBORS = 4;
     /** 敵は動くので、この移動ターン数以内に囲める場合だけ狙う。 */
@@ -52,9 +56,9 @@ class Player {
     /** 倒せる敵がこの数以上のときだけATTACKする。自軍も3体失うので、それより多く倒す必要がある。 */
     static final int ATTACK_MIN_KILLS = 4;
     /** この数以上で固まった家は、敵のATTACKに狙われるものとして減点する。 */
-    static final int STACK_RISK_UNITS = 3;
+    static final int STACK_RISK_UNITS = 5;
     /** ATTACKされうる家でこの数以上の塊は、隣の家へ分けて損失を抑える。 */
-    static final int DISPERSE_STACK_UNITS = 4;
+    static final int DISPERSE_STACK_UNITS = 6;
     /** 次のターンにATTACKされうる塊への、1体あたりの減点。1体ずつ逃がす手が採用されるよう、計画変更の減点より大きくする。 */
     static final double STACK_RISK_PENALTY = 0.4;
     /** ロック中の三角形を解除できる配置の価値。 */
@@ -68,7 +72,31 @@ class Player {
     /** 局所探索で、ユニット1体の行き先を元の計画から変えるときの減点。 */
     static final double PLAN_CHANGE_PENALTY = 0.3;
     /** 移動計画の局所探索に使える時間。 */
-    static final long LOCAL_SEARCH_BUDGET_NANOS = 15_000_000L;
+    static final long LOCAL_SEARCH_BUDGET_NANOS = 8_000_000L;
+    /** 占領の数だけを最大化する探索に使える時間。 */
+    static final long CAPTURE_SEARCH_BUDGET_NANOS = 12_000_000L;
+    /** 占領の数だけを最大化する探索で、ランダムな配置からやり直す間隔。 */
+    static final int CAPTURE_SEARCH_RESTART_ITERATIONS = 3000;
+    /** 序盤の探索を使う最後のターン。これより後は、敵と接触していなくても中盤の処理へ移る。 */
+    static final int OPENING_LAST_TURN = 8;
+    /** 序盤の探索が先読みする最後のターン。 */
+    static final int OPENING_HORIZON_TURN = 7;
+    /** 序盤の探索を途中でやり直すときの、最低の先読みターン数。 */
+    static final int OPENING_MIN_DEPTH = 3;
+    /** 自軍のユニットとこの距離以内に敵が来たら、序盤の探索をやめる。 */
+    static final int OPENING_CONTACT_DISTANCE = 1;
+    /** 1ターン目の探索に使える時間。最初のターンの制限は1000ms。 */
+    static final long OPENING_FIRST_BUDGET_NANOS = 700_000_000L;
+    /** 2ターン目以降に探索をやり直すときの時間。 */
+    static final long OPENING_REPLAN_BUDGET_NANOS = 35_000_000L;
+    /** 1ターン目の探索で、各ターンに残す候補の数。 */
+    static final int OPENING_FIRST_BEAM_WIDTH = 40;
+    /** 探索をやり直すときに、各ターンに残す候補の数。時間が短いので少なくする。 */
+    static final int OPENING_REPLAN_BEAM_WIDTH = 12;
+    /** 序盤の候補の評価で、ロック中の三角形1つへの減点。 */
+    static final double OPENING_LOCK_PENALTY = 0.05;
+    /** 余りユニットの援軍として数える、目標の家からの距離。 */
+    static final int LEFTOVER_FORCE_DISTANCE = 2;
     /** 敵の配置がこのターン数変わらなければ、敵は止まっていると見なす。 */
     static final int ENEMY_IDLE_TURNS = 2;
     /** 包囲対策に使える時間。1ターン50msの制限に余裕を残す。 */
@@ -86,6 +114,9 @@ class Player {
     static int[][] neighbors;
     /** distances[家A][家B]: 家Aから家Bまでの最短の移動ターン数。 */
     static int[][] distances;
+    /** linkHouses[i]: 新しく道を引ける家の組。Goldから送られてくる。 */
+    static int[][] linkHouses;
+    static int linkCount;
     static int triCount;
     static int[][] triHouses;
     static int[] owner;
@@ -97,8 +128,17 @@ class Player {
     static int[] committed;
     /** moves[移動元][移動先]: 今ターンに隣の家へ動かすユニットの数。最後にMOVEコマンドへ変換する。 */
     static int[][] moves;
+    /** 今ターンにSPAWNする三角形の一覧と、それぞれの生まれる角。移動と一緒に局所探索で決める。 */
+    static List<Integer> spawnTriangles;
+    static int[] spawnCorners;
+    /** spawnedUnits[家]: 今ターンのSPAWNでその家に生まれるユニットの数。 */
+    static int[] spawnedUnits;
     /** idleLeftovers[家]: 仕事も行き先もなく、その家に残る予定のユニットの数。局所探索で自由に動かせる。 */
     static int[] idleLeftovers;
+    /** capturableCounts[家]: その家を角に持つ、自分が占領できる三角形の数。 */
+    static int[] capturableCounts;
+    /** enemyDeepHouses[家]: 隣の家の半分より多くを敵が押さえている家なら true。入ると孤立しやすい。 */
+    static boolean[] enemyDeepHouses;
     /** lockCounts[家]: その家を角に持つロック中の三角形の数。 */
     static int[] lockCounts;
     /** 包囲の分析用。前のターンの移動後の予定配置と、そのとき包囲の恐れがあると見た家。 */
@@ -114,6 +154,38 @@ class Player {
     static int[][] attackTargets;
     /** moveScoreの作業用。その家がATTACKされうるならtrue。 */
     static boolean[] attackable;
+
+    /**
+     * 序盤の探索の1つの局面。敵を動かさずに、自分だけの手順を先読みする。
+     * 親の局面から、moveToの移動とspawnのSPAWNを行うと、この局面になる。
+     */
+    static final class OpeningState {
+        /** ユニット1体ごとの家。 */
+        int[] units;
+        /** owned[三角形]: 自分の三角形なら true。 */
+        boolean[] owned;
+        /** locked[三角形]: 自分が再占領できない三角形なら true。 */
+        boolean[] locked;
+        /** 局面の良さ。ユニットと三角形の数を足し、ロックを減点する。 */
+        double score;
+        OpeningState parent;
+        /** moveTo[i]: 親のユニットiの移動先。 */
+        int[] moveTo;
+        /** 親の局面でSPAWNする三角形と、それぞれの生まれる角。 */
+        int[] spawnTriangles, spawnCorners;
+    }
+
+    /** 序盤の探索をやめたら true。一度やめたら戻らない。 */
+    static boolean openingFinished;
+    /** openingOptions[家]: 序盤にその家から移動できる先。留まる手を含み、敵の方が近い家は除く。 */
+    static int[][] openingOptions;
+    /** openingHomeHouses[家]: 開始位置から、敵より早く、または同時に着く家なら true。 */
+    static boolean[] openingHomeHouses;
+    /** 探索で見つけた手順。openingPlan[i]が、ターンopeningPlanFirstTurn + iの手を持つ局面。 */
+    static OpeningState[] openingPlan;
+    static int openingPlanFirstTurn;
+    /** 序盤の探索の作業用。家ごとの持ち主の判定結果。 */
+    static boolean[] openingOwnedHouses;
 
     static final Random random = new Random(0);
     /** 前のターンの敵ユニットの配置。 */
@@ -282,10 +354,11 @@ class Player {
             meCanCapture[i] = next() == 1;
             opCanCapture[i] = next() == 1;
         }
-        int linkable = next();
-        for (int i = 0; i < linkable; i++) {
-            next();
-            next();
+        linkCount = next();
+        linkHouses = new int[linkCount][2];
+        for (int i = 0; i < linkCount; i++) {
+            linkHouses[i][0] = next();
+            linkHouses[i][1] = next();
         }
         buildGraph();
     }
@@ -342,7 +415,16 @@ class Player {
 
     static String decide(int turn) {
         List<String> commands = new ArrayList<>();
-        addAttacks(commands);
+        OpeningState openingStep = nextOpeningStep(turn);
+        if (openingStep == null) {
+            addAttacks(commands);
+            addPathAction(commands, turn);
+            // SPAWNは移動の後で占領の前に処理される。先に決めれば、同じターンに角を離れられ、
+            // 生まれるユニットをそのターンの占領にも使える。
+            chooseSpawns(turn);
+        } else {
+            markOpeningSpawns(openingStep);
+        }
 
         free = myUnits.clone();
         committed = new int[houseCount];
@@ -350,12 +432,17 @@ class Player {
         idleLeftovers = new int[houseCount];
         lockCounts = countLocks();
         findThreats();
-
-        assignTargets();
-        assignLeftovers();
-        improveMoves();
-        avoidSurrounds();
-        disperseStacks();
+        readFrontline();
+        if (openingStep == null) {
+            placeSpawns();
+            assignTargets();
+            assignLeftovers();
+            improveMoves();
+            avoidSurrounds();
+            disperseStacks();
+        } else {
+            applyOpeningStep(openingStep);
+        }
 
         for (int from = 0; from < houseCount; from++) {
             for (int to = 0; to < houseCount; to++) {
@@ -363,7 +450,7 @@ class Player {
                     commands.add("MOVE " + from + " " + to + " " + moves[from][to]);
             }
         }
-        addSpawns(turn, commands);
+        addSpawns(commands);
         return commands.isEmpty() ? "WAIT" : String.join(";", commands);
     }
 
@@ -393,6 +480,138 @@ class Player {
             for (int corner : corners)
                 myUnits[corner]--;
         }
+    }
+
+    /**
+     * 自分の三角形を1つ使い、ADD_PATHかREMOVE_PATHを1回だけ行う。得が大きい方を選ぶ。
+     * 道の処理は移動の後なので、消費する1体を各角で確保してから移動を決める。
+     */
+    static void addPathAction(List<String> commands, int turn) {
+        int bestTriangle = -1, bestGain = 0, addFrom = -1, addTo = -1;
+        String bestCommand = null;
+        for (int triangle = 0; triangle < triCount; triangle++) {
+            int[] corners = triHouses[triangle];
+            if (owner[triangle] != 0 || myUnits[corners[0]] == 0 || myUnits[corners[1]] == 0
+                    || myUnits[corners[2]] == 0)
+                continue;
+            // 道を引くと各角の1体を失うので、その後の配置で評価する。
+            for (int corner : corners)
+                myUnits[corner]--;
+            for (int i = 0; i < linkCount; i++) {
+                for (int side = 0; side < 2; side++) {
+                    int from = linkHouses[i][side], to = linkHouses[i][1 - side];
+                    if (!isCorner(triangle, from))
+                        continue;
+                    int gain = capturableNewTriangles(from, to);
+                    if (gain >= ADD_PATH_MIN_TRIANGLES && gain > bestGain) {
+                        bestGain = gain;
+                        bestTriangle = triangle;
+                        bestCommand = "ADD_PATH " + cornerOrder(triangle, from) + " " + to;
+                        addFrom = from;
+                        addTo = to;
+                    }
+                }
+            }
+            for (int from : corners) {
+                for (int to : neighbors[from]) {
+                    if (isCorner(triangle, to))
+                        continue;
+                    int gain = enemyTrianglesOnPath(from, to);
+                    if (gain >= REMOVE_PATH_MIN_TRIANGLES && gain > bestGain) {
+                        bestGain = gain;
+                        bestTriangle = triangle;
+                        bestCommand = "REMOVE_PATH " + cornerOrder(triangle, from) + " " + to;
+                        addFrom = -1;
+                    }
+                }
+            }
+            for (int corner : corners)
+                myUnits[corner]++;
+        }
+        if (bestTriangle < 0)
+            return;
+        commands.add(bestCommand);
+        System.err.println("P" + turn + " " + bestCommand + " gain=" + bestGain);
+        for (int corner : triHouses[bestTriangle])
+            myUnits[corner]--;
+        owner[bestTriangle] = -1;
+        meCanCapture[bestTriangle] = false;
+        if (addFrom >= 0)
+            holdNewTriangles(addFrom, addTo);
+    }
+
+    /**
+     * 新しい三角形をこのターンに占領できるよう、その角のユニットを動かさない。
+     * 移動の計画から隠すために、盤面の情報のユニット数から引いておく。
+     */
+    static void holdNewTriangles(int a, int b) {
+        boolean[] held = new boolean[houseCount];
+        held[a] = held[b] = true;
+        for (int third : neighbors[a])
+            if (isConnected[b][third] && myUnits[third] > opponentUnits[third] && isEmptyTriangle(a, b, third))
+                held[third] = true;
+        for (int house = 0; house < houseCount; house++)
+            if (held[house])
+                myUnits[house] -= opponentUnits[house] + 1;
+    }
+
+    static boolean isCorner(int triangle, int house) {
+        int[] corners = triHouses[triangle];
+        return corners[0] == house || corners[1] == house || corners[2] == house;
+    }
+
+    /** 三角形の角を、firstが先頭になる順に並べた文字列を返す。コマンドの先頭の角が道の端になる。 */
+    static String cornerOrder(int triangle, int first) {
+        StringBuilder order = new StringBuilder().append(first);
+        for (int corner : triHouses[triangle])
+            if (corner != first)
+                order.append(' ').append(corner);
+        return order.toString();
+    }
+
+    /** 家aと家bを結ぶと生まれる三角形のうち、今の配置のまま自分のものになる数を返す。 */
+    static int capturableNewTriangles(int a, int b) {
+        if (myUnits[a] <= opponentUnits[a] || myUnits[b] <= opponentUnits[b])
+            return 0;
+        int count = 0;
+        for (int third : neighbors[a]) {
+            if (isConnected[b][third] && myUnits[third] > opponentUnits[third] && isEmptyTriangle(a, b, third))
+                count++;
+        }
+        return count;
+    }
+
+    /** 家aと家bの道を含む三角形のうち、敵の数から自分の数を引いた値を返す。 */
+    static int enemyTrianglesOnPath(int a, int b) {
+        int count = 0;
+        for (int triangle = 0; triangle < triCount; triangle++) {
+            if (!isCorner(triangle, a) || !isCorner(triangle, b))
+                continue;
+            if (owner[triangle] == 1)
+                count++;
+            else if (owner[triangle] == 0)
+                count--;
+        }
+        return count;
+    }
+
+    /** 3つの家の内側に他の家がなければtrueを返す。内側に家があると三角形として認められない。 */
+    static boolean isEmptyTriangle(int a, int b, int c) {
+        for (int house = 0; house < houseCount; house++) {
+            if (house == a || house == b || house == c)
+                continue;
+            boolean side1 = isCounterClockwise(a, b, house), side2 = isCounterClockwise(b, c, house),
+                    side3 = isCounterClockwise(c, a, house);
+            if (side1 == side2 && side2 == side3)
+                return false;
+        }
+        return true;
+    }
+
+    /** 審判のccwと同じ判定。 */
+    static boolean isCounterClockwise(int a, int b, int c) {
+        return (long) (houseYs[c] - houseYs[a]) * (houseXs[b] - houseXs[a])
+                > (long) (houseYs[b] - houseYs[a]) * (houseXs[c] - houseXs[a]);
     }
 
     /**
@@ -644,12 +863,14 @@ class Player {
             // まだ行き先が決まっていない、その家のユニットも味方として数える。
             boolean needsMoreUnits = committed[candidate] + free[candidate] <= opponentUnits[candidate];
             boolean reachable = distances[house][candidate] < UNREACHABLE;
-            if (hasEnemy && needsMoreUnits && reachable
+            // 勝てない家や敵に囲まれた家へ1体ずつ入ると、孤立して包囲で失う。
+            boolean canFight = !enemyDeepHouses[candidate] && canOutnumber(candidate);
+            if (hasEnemy && needsMoreUnits && reachable && canFight
                     && (best < 0 || distances[house][candidate] < distances[house][best]))
                 best = candidate;
         }
         boolean enemyIsClose = best >= 0 && distances[house][best] <= LEFTOVER_ENEMY_CLOSE_DISTANCE;
-        if (enemyIsClose || lockCounts[house] == 0)
+        if (enemyIsClose || lockCounts[house] == 0 && hasCapturableNearby(house))
             return best;
 
         // 近くに敵がいないので、三角形を再占領できるようにロック中の家から離れる。
@@ -657,7 +878,8 @@ class Player {
         best = -1;
         for (int candidate = 0; candidate < houseCount; candidate++) {
             boolean reachable = distances[house][candidate] < UNREACHABLE;
-            if (lockCounts[candidate] == 0 && reachable
+            boolean isUsefulCorner = capturableCounts[candidate] > 0 && !enemyDeepHouses[candidate];
+            if (lockCounts[candidate] == 0 && isUsefulCorner && reachable
                     && (best < 0 || distances[house][candidate] < distances[house][best]))
                 best = candidate;
         }
@@ -669,9 +891,11 @@ class Player {
      * 上がらない変更は捨てるので、遠くの仕事へ向かう移動はそのまま残る。
      */
     static void improveMoves() {
-        int unitCount = 0;
+        int realUnits = 0;
         for (int house = 0; house < houseCount; house++)
-            unitCount += myUnits[house];
+            realUnits += myUnits[house];
+        // SPAWNで生まれるユニットも、三角形の角を選ぶユニットとして一緒に探索する。
+        int unitCount = realUnits + spawnCorners.length;
         if (unitCount == 0)
             return;
 
@@ -694,8 +918,14 @@ class Player {
                 }
             }
         }
+        for (int i = 0; i < spawnCorners.length; i++) {
+            isIdle[index] = true;
+            unitFrom[index] = -1;
+            unitTo[index++] = spawnCorners[i];
+        }
 
         int[] projected = projectedUnits();
+        projected = searchCaptures(unitFrom, unitTo, realUnits, projected);
         // 元の計画は遠くの仕事へ向かう移動を含むので、確かな得がなければ変えない。
         int[] plannedTo = unitTo.clone();
         int deviations = 0;
@@ -705,9 +935,15 @@ class Player {
             if ((iteration & 255) == 0 && System.nanoTime() > deadline)
                 break;
             int unit = random.nextInt(unitCount);
-            int[] options = neighbors[unitFrom[unit]];
-            int choice = random.nextInt(options.length + 1);
-            int newTo = choice == options.length ? unitFrom[unit] : options[choice];
+            int newTo;
+            if (unit >= realUnits) {
+                int[] corners = triHouses[spawnTriangles.get(unit - realUnits)];
+                newTo = corners[random.nextInt(3)];
+            } else {
+                int[] options = neighbors[unitFrom[unit]];
+                int choice = random.nextInt(options.length + 1);
+                newTo = choice == options.length ? unitFrom[unit] : options[choice];
+            }
             int oldTo = unitTo[unit];
             if (newTo == oldTo)
                 continue;
@@ -728,10 +964,124 @@ class Player {
         }
 
         moves = new int[houseCount][houseCount];
-        for (int unit = 0; unit < unitCount; unit++) {
+        for (int unit = 0; unit < realUnits; unit++) {
             if (unitTo[unit] != unitFrom[unit])
                 moves[unitFrom[unit]][unitTo[unit]]++;
         }
+        spawnedUnits = new int[houseCount];
+        for (int i = 0; i < spawnCorners.length; i++) {
+            spawnCorners[i] = unitTo[realUnits + i];
+            spawnedUnits[spawnCorners[i]]++;
+        }
+    }
+
+    /**
+     * 占領の数だけを最大化する配置を探し、計画より多く占領できるならunitToを置き換える。
+     * 占領には2〜3体の同時の移動が要るので、同点の手も受け入れ、ランダムな配置から何度もやり直す。
+     * 戻り値は採用した配置の、家ごとのユニット数。
+     */
+    static int[] searchCaptures(int[] unitFrom, int[] unitTo, int realUnits, int[] projected) {
+        double planScore = capturedValue(projected);
+        int unitCount = unitTo.length;
+        int[] current = new int[unitCount], best = null;
+        int[] counts = new int[houseCount];
+        double bestScore = planScore;
+        long deadline = System.nanoTime() + CAPTURE_SEARCH_BUDGET_NANOS;
+        double score = 0;
+        for (int iteration = 0;; iteration++) {
+            if ((iteration & 127) == 0 && System.nanoTime() > deadline)
+                break;
+            if (iteration % CAPTURE_SEARCH_RESTART_ITERATIONS == 0) {
+                Arrays.fill(counts, 0);
+                for (int unit = 0; unit < unitCount; unit++) {
+                    current[unit] = randomDestination(unit, unitFrom, realUnits);
+                    counts[current[unit]]++;
+                }
+                score = captureScore(counts);
+            }
+            int unit = random.nextInt(unitCount);
+            int oldTo = current[unit], newTo = randomDestination(unit, unitFrom, realUnits);
+            if (newTo == oldTo)
+                continue;
+            counts[oldTo]--;
+            counts[newTo]++;
+            double newScore = captureScore(counts);
+            if (newScore >= score) {
+                score = newScore;
+                current[unit] = newTo;
+                double captured = capturedValue(counts);
+                if (captured > bestScore + 1e-9) {
+                    bestScore = captured;
+                    best = current.clone();
+                }
+            } else {
+                counts[oldTo]++;
+                counts[newTo]--;
+            }
+        }
+        if (best == null)
+            return projected;
+        int[] result = new int[houseCount];
+        for (int house : best)
+            result[house]++;
+        // 占領に関わらないユニットは、元の計画の行き先に戻す。遠くの仕事へ向かう動きを残すため。
+        for (int unit = 0; unit < unitCount; unit++) {
+            int planned = unitTo[unit], searched = best[unit];
+            if (planned == searched)
+                continue;
+            result[searched]--;
+            result[planned]++;
+            if (capturedValue(result) >= bestScore - 1e-9) {
+                best[unit] = planned;
+            } else {
+                result[searched]++;
+                result[planned]--;
+            }
+        }
+        System.arraycopy(best, 0, unitTo, 0, unitCount);
+        return result;
+    }
+
+    /** 今の敵の配置で占領できる三角形の価値の合計を返す。 */
+    static double capturedValue(int[] projected) {
+        boolean[] owned = housesOwned(projected);
+        double value = 0;
+        for (int triangle = 0; triangle < triCount; triangle++) {
+            if (owner[triangle] == 0 || !meCanCapture[triangle])
+                continue;
+            int[] corners = triHouses[triangle];
+            if (owned[corners[0]] && owned[corners[1]] && owned[corners[2]])
+                value += owner[triangle] == 1 ? VALUE_ENEMY : VALUE_NEUTRAL;
+        }
+        return value;
+    }
+
+    /** ユニットの行き先をランダムに返す。SPAWNのユニットは三角形の角から選ぶ。 */
+    static int randomDestination(int unit, int[] unitFrom, int realUnits) {
+        if (unit >= realUnits)
+            return triHouses[spawnTriangles.get(unit - realUnits)][random.nextInt(3)];
+        int[] options = neighbors[unitFrom[unit]];
+        int choice = random.nextInt(options.length + 1);
+        return choice == options.length ? unitFrom[unit] : options[choice];
+    }
+
+    /** 今の敵の配置で、占領できる三角形の価値と、解除できるロックの価値の合計を返す。途中の段階に点は付けない。 */
+    static double captureScore(int[] projected) {
+        boolean[] owned = housesOwned(projected);
+        double score = 0;
+        for (int triangle = 0; triangle < triCount; triangle++) {
+            if (owner[triangle] == 0)
+                continue;
+            int[] corners = triHouses[triangle];
+            int a = corners[0], b = corners[1], c = corners[2];
+            if (meCanCapture[triangle]) {
+                if (owned[a] && owned[b] && owned[c])
+                    score += owner[triangle] == 1 ? VALUE_ENEMY : VALUE_NEUTRAL;
+            } else if (projected[a] == 0 && projected[b] == 0 && projected[c] == 0) {
+                score += VALUE_UNLOCK;
+            }
+        }
+        return score;
     }
 
     /**
@@ -822,6 +1172,12 @@ class Player {
      */
     static boolean[] housesOwned(int[] projected) {
         boolean[] owned = new boolean[houseCount];
+        fillHousesOwned(projected, owned);
+        return owned;
+    }
+
+    /** housesOwnedの判定結果をownedへ書く。探索の中で配列を作り直さないために分けている。 */
+    static void fillHousesOwned(int[] projected, boolean[] owned) {
         for (int house = 0; house < houseCount; house++) {
             boolean allMine = neighbors[house].length > 0, allEnemy = neighbors[house].length > 0;
             for (int neighbor : neighbors[house]) {
@@ -830,7 +1186,6 @@ class Player {
             }
             owned[house] = allMine || !allEnemy && projected[house] > opponentUnits[house];
         }
-        return owned;
     }
 
     /** 移動後の配置の良さを返す。次のターンの占領とロック解除を加点し、狙われる塊を減点する。 */
@@ -958,7 +1313,7 @@ class Player {
                         && (stack < 0 || projected[house] > projected[stack]))
                     stack = house;
             }
-            if (stack < 0 || !moveOneUnitAway(stack, projected))
+            if (stack < 0 || keepsCapture(stack, projected) || !moveOneUnitAway(stack, projected))
                 return;
         }
     }
@@ -967,6 +1322,15 @@ class Player {
      * stackへ向かう、またはstackに残るユニットを1体、より小さな家へ変更する。
      * 行き先は、撃たれない家を優先し、その中で最もユニットが少ない家を選ぶ。変更できなければfalseを返す。
      */
+    /** その家から1体減らすと占領できる三角形が減るならtrueを返す。占領に必要な塊は残す。 */
+    static boolean keepsCapture(int stack, int[] projected) {
+        double before = capturedValue(projected);
+        projected[stack]--;
+        double after = capturedValue(projected);
+        projected[stack]++;
+        return after < before;
+    }
+
     static boolean moveOneUnitAway(int stack, int[] projected) {
         int bestFrom = -1, bestTo = -1, bestCost = Integer.MAX_VALUE;
         for (int from = 0; from < houseCount; from++) {
@@ -996,9 +1360,11 @@ class Player {
         return true;
     }
 
-    /** 今ターンの移動後に、各家にいる自分のユニット数を返す。 */
+    /** 今ターンの移動とSPAWNの後に、各家にいる自分のユニット数を返す。 */
     static int[] projectedUnits() {
         int[] projected = myUnits.clone();
+        for (int house = 0; house < houseCount; house++)
+            projected[house] += spawnedUnits[house];
         for (int from = 0; from < houseCount; from++) {
             for (int to = 0; to < houseCount; to++) {
                 projected[from] -= moves[from][to];
@@ -1083,7 +1449,12 @@ class Player {
         return false;
     }
 
-    static void addSpawns(int turn, List<String> commands) {
+    /**
+     * 今ターンにSPAWNする三角形を決め、ロック中として扱うように盤面の情報を更新する。
+     * 移動を決める前に呼ぶ。
+     */
+    static void chooseSpawns(int turn) {
+        spawnTriangles = new ArrayList<>();
         // 敵が止まったら、三角形を持ち続けるだけで得点差が開いていく。
         if (MAX_TURNS - turn < SPAWN_STOP_TURNS_LEFT || enemyIdleTurns >= ENEMY_IDLE_TURNS)
             return;
@@ -1096,27 +1467,34 @@ class Player {
             if (owner[t] != 0)
                 continue;
             if (turn >= SPAWN_FREE_UNTIL_TURN && mine >= theirs + SPAWN_UNIT_LEAD)
-                return;
-            int corner = spawnCorner(t);
-            int[] c = triHouses[t];
-            int a = c[0] == corner ? c[1] : c[0];
-            int b = c[2] == corner ? c[1] : c[2];
-            commands.add("SPAWN " + corner + " " + a + " " + b);
+                break;
+            spawnTriangles.add(t);
             mine++;
+        }
+        for (int t : spawnTriangles) {
+            owner[t] = -1;
+            meCanCapture[t] = false;
         }
     }
 
-    /** その家を角に持つ自分の三角形の数を返す。SPAWNすると、これらもロックされる。 */
-    static int ownedTriangles(int house) {
-        int count = 0;
-        for (int triangle = 0; triangle < triCount; triangle++) {
-            if (owner[triangle] != 0)
-                continue;
-            for (int corner : triHouses[triangle])
-                if (corner == house)
-                    count++;
+    /** 生まれる角の初期値を決める。局所探索がこの後で変更する。 */
+    static void placeSpawns() {
+        spawnCorners = new int[spawnTriangles.size()];
+        spawnedUnits = new int[houseCount];
+        for (int i = 0; i < spawnCorners.length; i++) {
+            spawnCorners[i] = spawnCorner(spawnTriangles.get(i));
+            spawnedUnits[spawnCorners[i]]++;
         }
-        return count;
+    }
+
+    static void addSpawns(List<String> commands) {
+        for (int i = 0; i < spawnCorners.length; i++) {
+            int corner = spawnCorners[i];
+            int[] c = triHouses[spawnTriangles.get(i)];
+            int a = c[0] == corner ? c[1] : c[0];
+            int b = c[2] == corner ? c[1] : c[2];
+            commands.add("SPAWN " + corner + " " + a + " " + b);
+        }
     }
 
     /**
@@ -1134,7 +1512,7 @@ class Player {
                     d = Math.min(d, distances[c][k]);
             }
             // 生まれたユニットはその角のロックを止めるので、止める三角形が少ない角を優先する。
-            int locks = lockCounts[c] + ownedTriangles(c);
+            int locks = lockCounts[c];
             if (locks < bestLocks || locks == bestLocks && d < bestDist) {
                 bestLocks = locks;
                 bestDist = d;
@@ -1142,5 +1520,301 @@ class Player {
             }
         }
         return best;
+    }
+
+    /**
+     * 今ターンに実行する序盤の手を返す。序盤の探索を使わないターンならnullを返す。
+     * 敵と接触するまでの序盤は、敵に邪魔されない単独の増殖の競争になる。
+     * 計画どおりに進んでいれば計画の手を使い、ずれたら今の盤面から探索し直す。
+     */
+    static OpeningState nextOpeningStep(int turn) {
+        if (openingFinished)
+            return null;
+        if (turn > OPENING_LAST_TURN || enemyIsNearMyUnits()) {
+            openingFinished = true;
+            System.err.println("O" + turn + " handover");
+            return null;
+        }
+        if (openingHomeHouses == null)
+            findOpeningHomeHouses();
+        int planIndex = turn - openingPlanFirstTurn;
+        if (openingPlan != null && planIndex >= 0 && planIndex < openingPlan.length
+                && matchesBoard(openingPlan[planIndex].parent))
+            return openingPlan[planIndex];
+
+        long budget = turn == 1 ? OPENING_FIRST_BUDGET_NANOS : OPENING_REPLAN_BUDGET_NANOS;
+        int width = turn == 1 ? OPENING_FIRST_BEAM_WIDTH : OPENING_REPLAN_BEAM_WIDTH;
+        int depth = Math.max(OPENING_MIN_DEPTH, OPENING_HORIZON_TURN - turn + 1);
+        openingPlan = searchOpening(depth, budget, width);
+        openingPlanFirstTurn = turn;
+        if (openingPlan.length == 0)
+            return null;
+        System.err.println("O" + turn + " plan depth=" + openingPlan.length + " score="
+                + openingPlan[openingPlan.length - 1].score);
+        return openingPlan[0];
+    }
+
+    /** 自軍のユニットからOPENING_CONTACT_DISTANCE以内に敵がいればtrueを返す。 */
+    static boolean enemyIsNearMyUnits() {
+        for (int mine = 0; mine < houseCount; mine++) {
+            if (myUnits[mine] == 0)
+                continue;
+            for (int theirs = 0; theirs < houseCount; theirs++)
+                if (opponentUnits[theirs] > 0 && distances[mine][theirs] <= OPENING_CONTACT_DISTANCE)
+                    return true;
+        }
+        return false;
+    }
+
+    /** 開始位置から、敵より遅くならずに着ける家を記録する。序盤はこの範囲で動く。 */
+    static void findOpeningHomeHouses() {
+        openingHomeHouses = new boolean[houseCount];
+        for (int house = 0; house < houseCount; house++) {
+            int mine = UNREACHABLE, theirs = UNREACHABLE;
+            for (int start = 0; start < houseCount; start++) {
+                if (myUnits[start] > 0)
+                    mine = Math.min(mine, distances[start][house]);
+                if (opponentUnits[start] > 0)
+                    theirs = Math.min(theirs, distances[start][house]);
+            }
+            openingHomeHouses[house] = mine <= theirs;
+        }
+    }
+
+    /** 局面のユニットの配置と三角形が、今の盤面と同じならtrueを返す。 */
+    static boolean matchesBoard(OpeningState state) {
+        if (state.owned.length != triCount)
+            return false;
+        int[] counts = new int[houseCount];
+        for (int house : state.units)
+            counts[house]++;
+        if (!Arrays.equals(counts, myUnits))
+            return false;
+        for (int triangle = 0; triangle < triCount; triangle++)
+            if (state.owned[triangle] != (owner[triangle] == 0))
+                return false;
+        return true;
+    }
+
+    /** 今の盤面から、自分だけの手順をビームサーチで探す。戻り値は、今ターンから順に並べた局面。 */
+    static OpeningState[] searchOpening(int depth, long budget, int width) {
+        buildOpeningOptions();
+        openingOwnedHouses = new boolean[houseCount];
+        List<OpeningState> beam = new ArrayList<>();
+        beam.add(boardState());
+        long start = System.nanoTime();
+        for (int step = 0; step < depth; step++) {
+            long deadline = start + budget * (step + 1) / depth;
+            Map<Long, OpeningState> found = new HashMap<>();
+            int index = 0;
+            do {
+                expandOpening(beam.get(index++ % beam.size()), found);
+            } while (System.nanoTime() < deadline);
+            beam = new ArrayList<>(found.values());
+            beam.sort((a, b) -> Double.compare(b.score, a.score));
+            if (beam.size() > width)
+                beam = new ArrayList<>(beam.subList(0, width));
+        }
+        OpeningState[] plan = new OpeningState[depth];
+        OpeningState state = beam.get(0);
+        for (int step = depth - 1; step >= 0; step--) {
+            plan[step] = state;
+            state = state.parent;
+        }
+        return plan;
+    }
+
+    static void buildOpeningOptions() {
+        openingOptions = new int[houseCount][];
+        for (int house = 0; house < houseCount; house++) {
+            int count = 1;
+            for (int neighbor : neighbors[house])
+                if (openingHomeHouses[neighbor])
+                    count++;
+            openingOptions[house] = new int[count];
+            openingOptions[house][0] = house;
+            int index = 1;
+            for (int neighbor : neighbors[house])
+                if (openingHomeHouses[neighbor])
+                    openingOptions[house][index++] = neighbor;
+        }
+    }
+
+    /** 今の盤面を、探索の開始局面にして返す。 */
+    static OpeningState boardState() {
+        OpeningState state = new OpeningState();
+        int total = 0;
+        for (int house = 0; house < houseCount; house++)
+            total += myUnits[house];
+        state.units = new int[total];
+        int index = 0;
+        for (int house = 0; house < houseCount; house++)
+            for (int i = 0; i < myUnits[house]; i++)
+                state.units[index++] = house;
+        state.owned = new boolean[triCount];
+        state.locked = new boolean[triCount];
+        for (int triangle = 0; triangle < triCount; triangle++) {
+            state.owned[triangle] = owner[triangle] == 0;
+            state.locked[triangle] = isLocked(triangle);
+        }
+        return state;
+    }
+
+    /**
+     * 局面の次の手をランダムに1つ作り、占領が減らない変更を重ねて改善してfoundへ入れる。
+     * 三角形はすべてSPAWNする。占領の後すぐ増やすのが、増殖が最も速いため。
+     */
+    static void expandOpening(OpeningState state, Map<Long, OpeningState> found) {
+        int unitCount = state.units.length;
+        int spawnCount = 0;
+        for (boolean owned : state.owned)
+            if (owned)
+                spawnCount++;
+        int[] spawnTriangles = new int[spawnCount], spawnCorners = new int[spawnCount];
+        int[] moveTo = new int[unitCount], counts = new int[houseCount];
+        int index = 0;
+        for (int triangle = 0; triangle < triCount; triangle++) {
+            if (state.owned[triangle]) {
+                spawnTriangles[index] = triangle;
+                spawnCorners[index] = triHouses[triangle][random.nextInt(3)];
+                counts[spawnCorners[index++]]++;
+            }
+        }
+        for (int unit = 0; unit < unitCount; unit++) {
+            int[] options = openingOptions[state.units[unit]];
+            moveTo[unit] = options[random.nextInt(options.length)];
+            counts[moveTo[unit]]++;
+        }
+        int captured = countOpeningCaptures(state, counts, null);
+        int changes = 2 * (unitCount + spawnCount);
+        for (int change = 0; change < changes; change++) {
+            int pick = random.nextInt(unitCount + spawnCount);
+            boolean isUnit = pick < unitCount;
+            int[] destinations = isUnit ? moveTo : spawnCorners;
+            int slot = isUnit ? pick : pick - unitCount;
+            int oldTo = destinations[slot];
+            int newTo;
+            if (isUnit) {
+                int[] options = openingOptions[state.units[slot]];
+                newTo = options[random.nextInt(options.length)];
+            } else {
+                newTo = triHouses[spawnTriangles[slot]][random.nextInt(3)];
+            }
+            if (newTo == oldTo)
+                continue;
+            counts[oldTo]--;
+            counts[newTo]++;
+            int newCaptured = countOpeningCaptures(state, counts, null);
+            if (newCaptured >= captured) {
+                captured = newCaptured;
+                destinations[slot] = newTo;
+            } else {
+                counts[oldTo]++;
+                counts[newTo]--;
+            }
+        }
+
+        OpeningState child = new OpeningState();
+        child.parent = state;
+        child.moveTo = moveTo;
+        child.spawnTriangles = spawnTriangles;
+        child.spawnCorners = spawnCorners;
+        child.units = Arrays.copyOf(moveTo, unitCount + spawnCount);
+        System.arraycopy(spawnCorners, 0, child.units, unitCount, spawnCount);
+        child.owned = new boolean[triCount];
+        child.locked = new boolean[triCount];
+        countOpeningCaptures(state, counts, child);
+        int ownedCount = 0, lockedCount = 0;
+        long key = 1469598103934665603L;
+        for (int house = 0; house < houseCount; house++)
+            key = (key ^ counts[house]) * 1099511628211L;
+        for (int triangle = 0; triangle < triCount; triangle++) {
+            ownedCount += child.owned[triangle] ? 1 : 0;
+            lockedCount += child.locked[triangle] ? 1 : 0;
+            key = (key ^ (child.owned[triangle] ? 1 : 0) ^ (child.locked[triangle] ? 2 : 0)) * 1099511628211L;
+        }
+        child.score = child.units.length + ownedCount - OPENING_LOCK_PENALTY * lockedCount;
+        found.putIfAbsent(key, child);
+    }
+
+    /**
+     * 移動とSPAWNの後の配置countsで占領できる三角形の数を返す。審判と同じ順で、ロックを更新してから占領する。
+     * childがあれば、次の局面の三角形の状態をそこへ書く。
+     */
+    static int countOpeningCaptures(OpeningState state, int[] counts, OpeningState child) {
+        fillHousesOwned(counts, openingOwnedHouses);
+        int captured = 0;
+        for (int triangle = 0; triangle < triCount; triangle++) {
+            int[] corners = triHouses[triangle];
+            int a = corners[0], b = corners[1], c = corners[2];
+            boolean locked = (state.locked[triangle] || state.owned[triangle]) && counts[a] + counts[b] + counts[c] > 0;
+            boolean capture = !locked && openingOwnedHouses[a] && openingOwnedHouses[b] && openingOwnedHouses[c];
+            if (capture)
+                captured++;
+            if (child != null) {
+                child.locked[triangle] = locked;
+                child.owned[triangle] = capture;
+            }
+        }
+        return captured;
+    }
+
+    /** 序盤の手でSPAWNする三角形を、ロック中として盤面の情報に反映する。 */
+    static void markOpeningSpawns(OpeningState step) {
+        for (int triangle : step.spawnTriangles) {
+            owner[triangle] = -1;
+            meCanCapture[triangle] = false;
+        }
+    }
+
+    /** 序盤の手を、中盤と同じコマンド出力用の変数へ書く。 */
+    static void applyOpeningStep(OpeningState step) {
+        spawnTriangles = new ArrayList<>();
+        spawnCorners = step.spawnCorners.clone();
+        spawnedUnits = new int[houseCount];
+        for (int i = 0; i < step.spawnTriangles.length; i++) {
+            spawnTriangles.add(step.spawnTriangles[i]);
+            spawnedUnits[spawnCorners[i]]++;
+        }
+        int[] from = step.parent.units;
+        for (int unit = 0; unit < from.length; unit++)
+            if (step.moveTo[unit] != from[unit])
+                moves[from[unit]][step.moveTo[unit]]++;
+    }
+
+    /** 余りユニットの行き先を選ぶための、家ごとの情報を集める。 */
+    static void readFrontline() {
+        capturableCounts = new int[houseCount];
+        for (int triangle = 0; triangle < triCount; triangle++) {
+            if (owner[triangle] == 0 || !meCanCapture[triangle])
+                continue;
+            for (int corner : triHouses[triangle])
+                capturableCounts[corner]++;
+        }
+        enemyDeepHouses = new boolean[houseCount];
+        for (int house = 0; house < houseCount; house++) {
+            int held = 0;
+            for (int neighbor : neighbors[house])
+                if (opponentUnits[neighbor] > myUnits[neighbor])
+                    held++;
+            enemyDeepHouses[house] = held * 2 > neighbors[house].length;
+        }
+    }
+
+    /** 近くの味方を集めれば、その家で敵より多くなれるならtrueを返す。 */
+    static boolean canOutnumber(int house) {
+        int force = 0;
+        for (int other = 0; other < houseCount; other++)
+            if (distances[other][house] <= LEFTOVER_FORCE_DISTANCE)
+                force += myUnits[other];
+        return force > opponentUnits[house];
+    }
+
+    /** 2歩以内に、占領できる三角形の角があればtrueを返す。 */
+    static boolean hasCapturableNearby(int house) {
+        for (int other = 0; other < houseCount; other++)
+            if (capturableCounts[other] > 0 && distances[house][other] <= 2)
+                return true;
+        return false;
     }
 }
