@@ -77,8 +77,18 @@ class Player {
     static final long CAPTURE_SEARCH_BUDGET_NANOS = 12_000_000L;
     /** 占領の数だけを最大化する探索で、ランダムな配置からやり直す間隔。 */
     static final int CAPTURE_SEARCH_RESTART_ITERATIONS = 3000;
-    /** 序盤の探索を使う最後のターン。これより後は、敵と接触していなくても中盤の処理へ移る。 */
-    static final int OPENING_LAST_TURN = 8;
+    /**
+     * ゲームの段階。段階ごとに使う評価を切り替える。
+     * OPENING: ユニットを増やす段階。防衛と角の考慮を外し、三角形の作成だけを狙う。
+     * MIDGAME: 敵と競り合う段階。包囲の回避、塊の分散、ATTACKへの減点、行き止まりの角への減点を使う。
+     */
+    enum GamePhase { OPENING, MIDGAME }
+    /** 序盤の最後のターン。次のターンから中盤になる。 */
+    static final int OPENING_PHASE_LAST_TURN = 9;
+    /** 今のターンの段階。decideの最初に決める。 */
+    static GamePhase phase = GamePhase.OPENING;
+    /** 序盤の探索を使う最後のターン。序盤と同じにする。敵と接触したら、序盤の間でも探索をやめて通常の処理へ移る。 */
+    static final int OPENING_LAST_TURN = OPENING_PHASE_LAST_TURN;
     /** 序盤の探索が先読みする最後のターン。 */
     static final int OPENING_HORIZON_TURN = 7;
     /** 序盤の探索を途中でやり直すときの、最低の先読みターン数。 */
@@ -97,6 +107,14 @@ class Player {
     static final double OPENING_LOCK_PENALTY = 0.05;
     /** 余りユニットの援軍として数える、目標の家からの距離。 */
     static final int LEFTOVER_FORCE_DISTANCE = 2;
+    /**
+     * ロック中の三角形の角で、隣の家がすべてその三角形の角である家（行き止まりの角）にいるユニット1体への減点。
+     * そこから1歩動いても三角形の角に残るので、解除に2ターン以上かかる。隣が2軒だけの角などが当たる。
+     * ロック数の少なさだけで比べると、こうした角が選ばれやすいので、それを打ち消す大きさにする。
+     * 0.2では、隣の角のロックが4つ以上（LOCK_WAIT_PENALTYで0.2以上）のとき、行き止まりの角の方が安くなっていた。
+     * 行き止まりの角から出るには隣の角を通るので、本来の負担は隣の角より大きい。0.5なら、隣の角のロックが10未満の間は隣の角が選ばれる。
+     */
+    static final double TRAPPED_LOCK_PENALTY = 0.5;
     /** 敵の配置がこのターン数変わらなければ、敵は止まっていると見なす。 */
     static final int ENEMY_IDLE_TURNS = 2;
     /** 包囲対策に使える時間。1ターン50msの制限に余裕を残す。 */
@@ -139,6 +157,8 @@ class Player {
     static int[] capturableCounts;
     /** enemyDeepHouses[家]: 隣の家の半分より多くを敵が押さえている家なら true。入ると孤立しやすい。 */
     static boolean[] enemyDeepHouses;
+    /** trappedHouses[家]: ロック中の三角形の行き止まりの角なら true。TRAPPED_LOCK_PENALTYを参照。 */
+    static boolean[] trappedHouses;
     /** lockCounts[家]: その家を角に持つロック中の三角形の数。 */
     static int[] lockCounts;
     /** 包囲の分析用。前のターンの移動後の予定配置と、そのとき包囲の恐れがあると見た家。 */
@@ -415,6 +435,10 @@ class Player {
 
     static String decide(int turn) {
         List<String> commands = new ArrayList<>();
+        GamePhase newPhase = turn <= OPENING_PHASE_LAST_TURN ? GamePhase.OPENING : GamePhase.MIDGAME;
+        if (newPhase != phase)
+            System.err.println("P" + turn + " phase=" + newPhase);
+        phase = newPhase;
         OpeningState openingStep = nextOpeningStep(turn);
         if (openingStep == null) {
             addAttacks(commands);
@@ -431,6 +455,7 @@ class Player {
         moves = new int[houseCount][houseCount];
         idleLeftovers = new int[houseCount];
         lockCounts = countLocks();
+        trappedHouses = findTrappedHouses();
         findThreats();
         readFrontline();
         if (openingStep == null) {
@@ -438,8 +463,10 @@ class Player {
             assignTargets();
             assignLeftovers();
             improveMoves();
-            avoidSurrounds();
-            disperseStacks();
+            if (isDefending()) {
+                avoidSurrounds();
+                disperseStacks();
+            }
         } else {
             applyOpeningStep(openingStep);
         }
@@ -1207,9 +1234,15 @@ class Player {
                 score += VALUE_UNLOCK * UNLOCK_CREDIT[empty];
             }
         }
-        score -= surroundPenalty(projected);
+        boolean defending = isDefending();
+        if (defending)
+            score -= surroundPenalty(projected);
         for (int house = 0; house < houseCount; house++) {
             score -= LOCK_WAIT_PENALTY * lockCounts[house] * projected[house];
+            if (!defending)
+                continue;
+            if (trappedHouses[house])
+                score -= TRAPPED_LOCK_PENALTY * projected[house];
             if (attackable[house] && projected[house] >= STACK_RISK_UNITS)
                 score -= STACK_RISK_PENALTY * projected[house];
         }
@@ -1498,23 +1531,23 @@ class Player {
     }
 
     /**
-     * The corner closest to a triangle we do not own yet, where the new unit is
-     * useful soonest.
+     * 生まれる角の初期値を選ぶ。ロックを止める減点と、行き止まりの角への減点の合計が最も小さい角にする。
+     * 同点なら、占領できる三角形に近い角を選ぶ。局所探索がこの後で変更する。
      */
     static int spawnCorner(int t) {
-        int best = triHouses[t][0], bestLocks = Integer.MAX_VALUE, bestDist = Integer.MAX_VALUE;
+        int best = triHouses[t][0], bestDist = Integer.MAX_VALUE;
+        double bestCost = Double.MAX_VALUE;
         for (int c : triHouses[t]) {
-            int d = 1000;
+            int d = UNREACHABLE;
             for (int u = 0; u < triCount; u++) {
                 if (owner[u] == 0 || !meCanCapture[u])
                     continue;
                 for (int k : triHouses[u])
                     d = Math.min(d, distances[c][k]);
             }
-            // 生まれたユニットはその角のロックを止めるので、止める三角形が少ない角を優先する。
-            int locks = lockCounts[c];
-            if (locks < bestLocks || locks == bestLocks && d < bestDist) {
-                bestLocks = locks;
+            double cost = LOCK_WAIT_PENALTY * lockCounts[c] + (isDefending() && trappedHouses[c] ? TRAPPED_LOCK_PENALTY : 0);
+            if (cost < bestCost - 1e-9 || Math.abs(cost - bestCost) <= 1e-9 && d < bestDist) {
+                bestCost = cost;
                 bestDist = d;
                 best = c;
             }
@@ -1816,5 +1849,37 @@ class Player {
             if (capturableCounts[other] > 0 && distances[house][other] <= 2)
                 return true;
         return false;
+    }
+
+    /** 今の盤面で、ロック中の三角形の行き止まりの角を返す。SPAWNする三角形をロック中にした後で呼ぶ。 */
+    static boolean[] findTrappedHouses() {
+        boolean[] locked = new boolean[triCount];
+        for (int triangle = 0; triangle < triCount; triangle++)
+            locked[triangle] = isLocked(triangle);
+        boolean[] trapped = new boolean[houseCount];
+        for (int house = 0; house < houseCount; house++)
+            trapped[house] = isTrappedIn(house, locked);
+        return trapped;
+    }
+
+    /** houseが、lockedのいずれかの三角形の角で、隣の家がすべてその三角形の角ならtrueを返す。 */
+    static boolean isTrappedIn(int house, boolean[] locked) {
+        if (neighbors[house].length == 0)
+            return false;
+        for (int triangle = 0; triangle < triCount; triangle++) {
+            if (!locked[triangle] || !isCorner(triangle, house))
+                continue;
+            boolean allInside = true;
+            for (int neighbor : neighbors[house])
+                allInside &= isCorner(triangle, neighbor);
+            if (allInside)
+                return true;
+        }
+        return false;
+    }
+
+    /** 中盤以降ならtrueを返す。包囲の回避、塊の分散、ATTACKへの減点、行き止まりの角への減点は、中盤以降だけ使う。 */
+    static boolean isDefending() {
+        return phase == GamePhase.MIDGAME;
     }
 }
